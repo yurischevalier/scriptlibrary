@@ -34,6 +34,10 @@ libSource = string.gsub(libSource, "selected = selected %.%. option %.%. ', '", 
     return "selected = selected .. (option:gsub('%s*%b()', '')) .. ', '"
 end)
 
+-- Allow group_manager:create_slider to return slider_frame for visibility control
+local sliderPattern = "(function group_manager:create_slider.-user_input_service%.InputChanged:Connect.-end%s*%)%s*)(end%s*\n%s*function group_manager:create_button)"
+libSource = libSource:gsub(sliderPattern, "%1\treturn slider_frame\n\t\t%2")
+
 local compileLib, compileErr = loadstring(libSource)
 if not compileLib then
     warn("[YuriGFX] Failed to compile Library: " .. tostring(compileErr))
@@ -181,6 +185,10 @@ end
 
 local Remotes = Shared:WaitForChild("Remotes", 10)
 local ShopRemotes = Remotes:WaitForChild("Shop", 10)
+local EconomyRemotes = Remotes:WaitForChild("Economy", 10)
+local FarmRemotes = Remotes:WaitForChild("Farm", 10)
+local PetRemotes = Remotes:WaitForChild("Pets", 10)
+
 local ConfigFolder = Shared:WaitForChild("Config", 10)
 local UtilitiesFolder = Shared:WaitForChild("Utilities", 10)
 local CropConfig = require(ConfigFolder:WaitForChild("CropConfig"))
@@ -188,30 +196,138 @@ local ShopConfig = require(ConfigFolder:WaitForChild("ShopConfig"))
 local Language = require(Shared:WaitForChild("Language"))
 local Format = UtilitiesFolder and require(UtilitiesFolder:WaitForChild("Format"))
 
-local EconomyRemotes = Remotes:WaitForChild("Economy", 10)
+local PetConfig = nil
+pcall(function()
+    PetConfig = require(ConfigFolder:WaitForChild("PetConfig", 5))
+end)
+
 local BuySeedRemote = ShopRemotes:WaitForChild("BuySeed")
 local GetShopStateRemote = ShopRemotes:WaitForChild("GetShopState")
 local StockChangedRemote = ShopRemotes:WaitForChild("StockChanged")
 local GetSellTotalRemote = EconomyRemotes and EconomyRemotes:WaitForChild("GetSellTotal", 10)
 local SellAllRemote = EconomyRemotes and EconomyRemotes:WaitForChild("SellAll", 10)
 
--- Build Crop Mappings (Internal Name <-> Display Name <-> Option Label with Price)
+local FarmGetUpgradeRemote = FarmRemotes and FarmRemotes:WaitForChild("GetUpgrade", 10)
+local FarmUpgradeRemote = FarmRemotes and FarmRemotes:WaitForChild("UpgradeFarm", 10)
+local GetEggShopRemote = PetRemotes and PetRemotes:WaitForChild("GetEggShop", 10)
+local BuyEggRemote = PetRemotes and PetRemotes:WaitForChild("BuyEgg", 10)
+local EggStockChangedRemote = PetRemotes and PetRemotes:WaitForChild("EggStockChanged", 10)
+
+-- Helper to format numbers compactly with k / m (e.g. 77k, 100k, 1.1m, 3.5m)
+local function formatPriceShort(price)
+    price = tonumber(price) or 0
+    if price >= 1000000 then
+        local m = price / 1000000
+        if m % 1 == 0 then
+            return string.format("%dm", m)
+        else
+            return string.format("%.1fm", m)
+        end
+    elseif price >= 1000 then
+        local k = price / 1000
+        if k % 1 == 0 then
+            return string.format("%dk", k)
+        else
+            return string.format("%.1fk", k)
+        end
+    else
+        return tostring(price)
+    end
+end
+
+-- Universal live price text parser from game GUI (handles "₱103 (+15%)", "₱3.5M", "₱110,000", "₱7", etc.)
+local function parsePriceText(str)
+    if not str or str == "" then return nil end
+    local m = str:match("₱%s*([%d%.]+)%s*[Mm]")
+    if m then
+        return math.floor(tonumber(m) * 1000000 + 0.5)
+    end
+    local k = str:match("₱%s*([%d%.]+)%s*[Kk]")
+    if k then
+        return math.floor(tonumber(k) * 1000 + 0.5)
+    end
+    local base = str:match("₱%s*([%d%,]+)")
+    if base then
+        local clean = base:gsub(",", "")
+        return tonumber(clean)
+    end
+    return nil
+end
+
+-- Dynamic Seed Price resolver: dynamically updates for market surges (+15%) or server changes
+local function getSeedPrice(internalName)
+    local livePrice = nil
+    pcall(function()
+        local sf = LocalPlayer.PlayerGui.GUI.Frames.SeedsShop.ScrollingFrame
+        local item = sf:FindFirstChild(internalName)
+        if item then
+            local pLbl = item:FindFirstChild("Price", true)
+            if pLbl and pLbl.Text then
+                livePrice = parsePriceText(pLbl.Text)
+            end
+        end
+    end)
+    if livePrice and livePrice > 0 then
+        return livePrice
+    end
+
+    if CropConfig and CropConfig.Crops and CropConfig.Crops[internalName] then
+        local p = tonumber(CropConfig.Crops[internalName].SeedPrice)
+        if p and p > 0 then
+            return p
+        end
+    end
+
+    return 0
+end
+
+-- Dynamic Egg Price resolver: reads authoritative PetConfig or live UI card
+local function getEggPrice(eggId)
+    if PetConfig and PetConfig.Eggs and PetConfig.Eggs[eggId] then
+        local p = tonumber(PetConfig.Eggs[eggId].Price)
+        if p and p > 0 then
+            return p
+        end
+    end
+
+    local livePrice = nil
+    pcall(function()
+        local sf = LocalPlayer.PlayerGui.GUI.Frames.EggsShop.ScrollingFrame
+        local item = sf:FindFirstChild(eggId)
+        if item then
+            local pLbl = item:FindFirstChild("Price", true)
+            if pLbl and pLbl.Text then
+                livePrice = parsePriceText(pLbl.Text)
+            end
+        end
+    end)
+    if livePrice and livePrice > 0 then
+        return livePrice
+    end
+
+    return 0
+end
+
+-- Build Crop Mappings (Internal Name <-> Display Name <-> Option Label with Compact Price)
+-- Format: "Coffee (₱77k)", "Java Plum (₱100k)", "Mangosteen (₱3.8k)"
 local internalToDisplay = {}
 local displayToInternal = {}
 local internalToOption = {}
 local optionToInternal = {}
 local cropPrices = {}
 local cropRarities = {}
-local dropdownOptions = {}
-local cleanCropsList = {}
+local dropdownOptionsList = {}
 
 for _, internalName in ipairs(ShopConfig.SoldSeeds or {}) do
     local dispName = Language.Crop(internalName) or internalName
     local cropData = CropConfig.Crops[internalName] or {}
-    local price = cropData.SeedPrice or 0
+    local price = getSeedPrice(internalName)
+    if price <= 0 then
+        price = cropData.SeedPrice or 0
+    end
     local rarity = cropData.Rarity or "Common"
 
-    local priceText = (Format and Format.Cash and Format.Cash(price)) or string.format("₱%s", tostring(price))
+    local priceText = string.format("₱%s", formatPriceShort(price))
     local optionLabel = string.format("%s (%s)", dispName, priceText)
 
     internalToDisplay[internalName] = dispName
@@ -221,29 +337,77 @@ for _, internalName in ipairs(ShopConfig.SoldSeeds or {}) do
     cropPrices[internalName] = price
     cropRarities[internalName] = rarity
 
-    table.insert(dropdownOptions, optionLabel)
-    table.insert(cleanCropsList, dispName)
+    table.insert(dropdownOptionsList, {
+        label = optionLabel,
+        price = price,
+        disp = dispName
+    })
 end
 
 -- Sort dropdown options by price then name
-table.sort(dropdownOptions, function(a, b)
-    local intA = optionToInternal[a]
-    local intB = optionToInternal[b]
-    local pA = cropPrices[intA] or 0
-    local pB = cropPrices[intB] or 0
-    if pA ~= pB then
-        return pA < pB
+table.sort(dropdownOptionsList, function(a, b)
+    if a.price ~= b.price then
+        return a.price < b.price
     end
-    return a < b
+    return a.disp < b.disp
 end)
 
-table.sort(cleanCropsList)
+local seedOptionStrings = {}
+for _, item in ipairs(dropdownOptionsList) do
+    table.insert(seedOptionStrings, item.label)
+end
+
+-- Build Dynamic Egg List: loads all purchasable eggs directly from game's PetConfig / UI
+local function buildDynamicEggList()
+    local list = {}
+    if PetConfig and PetConfig.Eggs then
+        for eggId, data in pairs(PetConfig.Eggs) do
+            if type(data) == "table" and type(data.Price) == "number" and not data.Robux then
+                local dispName = data.DisplayName or (Language and Language.Egg and Language.Egg(eggId)) or eggId
+                table.insert(list, {
+                    id = eggId,
+                    disp = dispName,
+                    price = data.Price,
+                    hatchTime = data.HatchTime or 0
+                })
+            end
+        end
+    end
+
+    if #list == 0 then
+        list = {
+            { id = "AncientEgg", disp = "Legendary Egg", price = 3500000 },
+            { id = "MysticEgg", disp = "Epic Egg", price = 400000 },
+            { id = "ProvincialEgg", disp = "Rare Egg", price = 110000 },
+            { id = "FarmEgg", disp = "Uncommon Egg", price = 12000 },
+            { id = "BasicEgg", disp = "Common Egg", price = 3000 },
+        }
+    end
+
+    table.sort(list, function(a, b)
+        if a.price ~= b.price then
+            return a.price > b.price
+        end
+        return a.disp < b.disp
+    end)
+
+    return list
+end
+
+local EggList = buildDynamicEggList()
+local eggOptionStrings = {}
+for _, egg in ipairs(EggList) do
+    egg.price = getEggPrice(egg.id)
+    egg.priceText = string.format("₱%s", formatPriceShort(egg.price))
+    egg.label = string.format("%s (%s)", egg.disp, egg.priceText)
+    table.insert(eggOptionStrings, egg.label)
+end
 
 -- =========================================================================
 -- 5. FEATURE STATE & HELPERS
 -- =========================================================================
 local Settings = {
-    -- Auto Buy
+    -- Auto Buy Seeds
     AutoBuyEnabled = false,
     BuyAllInStock = false,
     BuyOnRestock = true,
@@ -257,6 +421,7 @@ local Settings = {
     -- Auto Harvest / Plants (Strictly Farm Plot Only)
     AutoHarvestEnabled = true, -- Automatically loads enabled
     RunningHarvest = false,
+    HarvestLoopRunning = false,
 
     -- Auto Sell Plants (Customizable Threshold: 250, 500, 600, or slider)
     AutoSellEnabled = false,
@@ -264,10 +429,29 @@ local Settings = {
     CustomThreshold = 250,
     RunningSell = false,
 
+    -- Land Upgrades
+    AutoUpgradeHouse = false,
+    AutoUpgradePlot = false,
+    RunningLandUpgrade = false,
+
+    -- Eggs Auto Buy
+    EggSniperEnabled = false,
+    SnipeOnRestock = true,
+    SnipeDelay = 0.15,
+    SelectedEggs = {},
+    CurrentEggStock = {},
+    NextEggRestock = 0,
+    RunningEggSnipe = false,
+
     -- General
     ActiveConnections = {},
     CleaningUp = false,
 }
+
+-- Dynamically select the top tier eggs by default
+for i = 1, math.min(3, #EggList) do
+    Settings.SelectedEggs[EggList[i].label] = true
+end
 
 -- Automatic Unload Function
 local function unloadUI()
@@ -277,7 +461,14 @@ local function unloadUI()
     Settings.BuyAllInStock = false
     Settings.AutoHarvestEnabled = false
     Settings.AutoSellEnabled = false
+    Settings.AutoUpgradeHouse = false
+    Settings.AutoUpgradePlot = false
+    Settings.EggSniperEnabled = false
     Settings.RunningSell = false
+    Settings.RunningHarvest = false
+    Settings.RunningPass = false
+    Settings.RunningLandUpgrade = false
+    Settings.RunningEggSnipe = false
 
     for _, conn in ipairs(Settings.ActiveConnections) do
         if conn and conn.Disconnect then
@@ -342,30 +533,28 @@ end
 -- Initial shop fetch
 fetchShopState()
 
-local function buyCrop(internalName)
-    local price = cropPrices[internalName] or 0
-    local myPesos = getPlayerPesos()
-
-    if myPesos < price then
-        return false
-    end
-
-    BuySeedRemote:FireServer(internalName)
-    return true
+local function isAutoBuyActive()
+    return (Settings.AutoBuyEnabled or Settings.BuyAllInStock) and not Settings.CleaningUp
 end
 
 local function executeBuyCycle(isManual)
     if Settings.RunningPass or Settings.CleaningUp then return 0 end
     Settings.RunningPass = true
 
-    fetchShopState()
+    -- Fetch latest stock if empty or triggered manually
+    if next(Settings.CurrentStock) == nil or isManual then
+        fetchShopState()
+    end
 
     local toBuy = {}
     for internalName, stockCount in pairs(Settings.CurrentStock) do
         if stockCount > 0 then
             local dispName = internalToDisplay[internalName] or internalName
             local optName = internalToOption[internalName] or dispName
-            local price = cropPrices[internalName] or 0
+            local price = getSeedPrice(internalName)
+            if price <= 0 then
+                price = cropPrices[internalName] or 0
+            end
 
             local shouldBuy = Settings.BuyAllInStock
 
@@ -375,10 +564,13 @@ local function executeBuyCycle(isManual)
                     or Settings.SelectedSeeds[internalName] == true
 
                 if not shouldBuy then
+                    local cleanDisp = dispName:lower():gsub("%s+", "")
+                    local cleanInternal = internalName:lower():gsub("%s+", "")
+
                     for selKey, isSelected in pairs(Settings.SelectedSeeds) do
                         if isSelected then
-                            local cleanKey = tostring(selKey):gsub("%s*%b()", "")
-                            if cleanKey == dispName or cleanKey == internalName then
+                            local cleanKey = tostring(selKey):gsub("%s*%b()", ""):lower():gsub("%s+", "")
+                            if cleanKey == cleanDisp or cleanKey == cleanInternal then
                                 shouldBuy = true
                                 break
                             end
@@ -406,41 +598,48 @@ local function executeBuyCycle(isManual)
         return a.internal < b.internal
     end)
 
+    local simulatedPesos = getPlayerPesos()
     local totalPurchased = 0
+
     for _, item in ipairs(toBuy) do
-        if not Settings.AutoBuyEnabled and not Settings.BuyAllInStock and not isManual then
+        if not isAutoBuyActive() and not isManual then
             break
         end
         if Settings.CleaningUp then break end
 
-        -- User requirement: depends on money/wallet, buy highest price first but make sure it can buy
-        local currentPesos = getPlayerPesos()
-        if currentPesos < item.price then
-            -- Cannot afford this expensive seed right now, skip to the next highest price seed we CAN afford
+        -- Skip item if we can't afford even a single seed at dynamic live price, move to cheaper seeds
+        local livePrice = getSeedPrice(item.internal)
+        if livePrice <= 0 then livePrice = item.price end
+
+        if simulatedPesos < livePrice then
             continue
         end
 
         local countBought = 0
-        for i = 1, item.stock do
-            if not Settings.AutoBuyEnabled and not Settings.BuyAllInStock and not isManual then
+        for _ = 1, item.stock do
+            if not isAutoBuyActive() and not isManual then
                 break
             end
             if Settings.CleaningUp then break end
 
-            currentPesos = getPlayerPesos()
-            if currentPesos < item.price then
-                -- Cannot afford any more of this seed, break to buy cheaper seeds with remaining change
+            local actualPesos = getPlayerPesos()
+            if actualPesos < simulatedPesos then
+                simulatedPesos = actualPesos
+            end
+
+            livePrice = getSeedPrice(item.internal)
+            if livePrice <= 0 then livePrice = item.price end
+
+            if simulatedPesos < livePrice then
+                -- Can't afford more of this seed; move to cheaper seeds with remaining change
                 break
             end
 
-            local success = buyCrop(item.internal)
-            if success then
-                countBought = countBought + 1
-                totalPurchased = totalPurchased + 1
-                task.wait(Settings.BuyDelay)
-            else
-                break
-            end
+            BuySeedRemote:FireServer(item.internal)
+            simulatedPesos = simulatedPesos - livePrice
+            countBought = countBought + 1
+            totalPurchased = totalPurchased + 1
+            task.wait(Settings.BuyDelay)
         end
 
         if countBought > 0 then
@@ -452,11 +651,6 @@ local function executeBuyCycle(isManual)
     return totalPurchased
 end
 
--- Controller to ensure background Auto-Buy loop runs whenever either toggle is active
-local function isAutoBuyActive()
-    return (Settings.AutoBuyEnabled or Settings.BuyAllInStock) and not Settings.CleaningUp
-end
-
 local function ensureBuyLoop()
     if Settings.BuyLoopRunning then return end
     Settings.BuyLoopRunning = true
@@ -465,7 +659,7 @@ local function ensureBuyLoop()
             pcall(function()
                 executeBuyCycle(false)
             end)
-            task.wait(math.max(Settings.BuyDelay, 0.4))
+            task.wait(math.max(Settings.BuyDelay, 0.5))
         end
         Settings.BuyLoopRunning = false
     end)
@@ -502,64 +696,167 @@ local function getPlayerFarm()
     return nil
 end
 
-local function getFarmPlantClusters()
-    local myFarm = getPlayerFarm()
-    if not myFarm then return {} end
+-- Land Upgrades Executor
+local function executeLandUpgrade(track, isManual)
+    if Settings.RunningLandUpgrade or Settings.CleaningUp then return false end
+    if not FarmGetUpgradeRemote or not FarmUpgradeRemote then return false end
 
-    local plantsFolder = myFarm:FindFirstChild("Plants")
-    if not plantsFolder then return {} end
+    Settings.RunningLandUpgrade = true
+    local upgraded = false
 
-    local char = LocalPlayer.Character
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if not hrp then return {} end
+    local success, err = pcall(function()
+        local upgradeData = FarmGetUpgradeRemote:InvokeServer()
+        if type(upgradeData) ~= "table" then return end
 
-    local clusters = {}
+        local info = upgradeData[track]
+        if type(info) ~= "table" then return end
 
-    -- Group ripe fruits by plant model strictly on the player's farm plot
-    for _, plant in ipairs(plantsFolder:GetChildren()) do
-        local ripePrompts = {}
-        for _, desc in ipairs(plant:GetDescendants()) do
-            if desc:IsA("ProximityPrompt") and desc.ActionText == "Pick" and desc.Enabled then
-                local part = desc.Parent
-                if part and part:IsA("BasePart") then
-                    table.insert(ripePrompts, {
-                        prompt = desc,
-                        part = part,
-                    })
+        local trackTitle = (track == "Plot" and "Backyard") or track
+        local currentName = info.CurrentName or trackTitle
+        local nextName = info.NextName or (trackTitle .. " " .. tostring(info.NextLevel or 2))
+        local cost = tonumber(info.Cost) or 0
+        local isMaxed = info.Maxed == true
+        local isAffordable = info.Affordable == true or (getPlayerPesos() >= cost and cost > 0)
+
+        if isMaxed then
+            if isManual then
+                Notify("Land Upgrade", string.format("%s is already at max level!", trackTitle), 2.5)
+            end
+            return
+        end
+
+        if not isAffordable then
+            if isManual then
+                local missing = math.max(0, cost - getPlayerPesos())
+                Notify("Land Upgrade", string.format("Need ₱%s more for %s!", formatPriceShort(missing), nextName), 3)
+            end
+            return
+        end
+
+        FarmUpgradeRemote:FireServer(track)
+        upgraded = true
+        Notify("Land Upgrade", string.format("Upgrading %s to %s for ₱%s!", currentName, nextName, formatPriceShort(cost)), 3.5)
+        task.wait(0.5)
+    end)
+
+    Settings.RunningLandUpgrade = false
+    return upgraded
+end
+
+-- Egg Sniper Helpers & Executor
+local function fetchEggShopState()
+    if not GetEggShopRemote then return false end
+    local success, result = pcall(function()
+        return GetEggShopRemote:InvokeServer()
+    end)
+    if success and type(result) == "table" then
+        Settings.CurrentEggStock = result.Stock or {}
+        Settings.NextEggRestock = result.NextRestock or 0
+        return true
+    end
+    return false
+end
+
+-- Initial egg shop fetch
+fetchEggShopState()
+
+local function executeEggSnipe(isManual)
+    if Settings.RunningEggSnipe or Settings.CleaningUp then return 0 end
+    if not BuyEggRemote then return 0 end
+
+    Settings.RunningEggSnipe = true
+    local totalSniped = 0
+
+    local success, err = pcall(function()
+        if next(Settings.CurrentEggStock) == nil or isManual then
+            fetchEggShopState()
+        end
+
+        local simulatedPesos = getPlayerPesos()
+
+        -- Process eggs in priority order (Highest tier first)
+        for _, egg in ipairs(EggList) do
+            if not Settings.EggSniperEnabled and not isManual then break end
+            if Settings.CleaningUp then break end
+
+            local isSelected = false
+            if Settings.SelectedEggs[egg.label] == true
+                or Settings.SelectedEggs[egg.disp] == true
+                or Settings.SelectedEggs[egg.id] == true then
+                isSelected = true
+            else
+                local cleanEgg = egg.disp:lower():gsub("%s+", "")
+                for selKey, val in pairs(Settings.SelectedEggs) do
+                    if val then
+                        local cleanKey = tostring(selKey):gsub("%s*%b()", ""):lower():gsub("%s+", "")
+                        if cleanKey == cleanEgg or cleanKey == egg.id:lower() then
+                            isSelected = true
+                            break
+                        end
+                    end
+                end
+            end
+
+            local availableStock = Settings.CurrentEggStock[egg.id] or 0
+            if isSelected and availableStock > 0 then
+                -- Live egg price directly from authoritative game data / live UI
+                local liveEggPrice = getEggPrice(egg.id)
+                if liveEggPrice <= 0 then liveEggPrice = egg.price or 0 end
+
+                if simulatedPesos < liveEggPrice then
+                    continue
+                end
+
+                local countBought = 0
+                for _ = 1, availableStock do
+                    if not Settings.EggSniperEnabled and not isManual then break end
+                    if Settings.CleaningUp then break end
+
+                    local actualPesos = getPlayerPesos()
+                    if actualPesos < simulatedPesos then
+                        simulatedPesos = actualPesos
+                    end
+
+                    liveEggPrice = getEggPrice(egg.id)
+                    if liveEggPrice <= 0 then liveEggPrice = egg.price or 0 end
+
+                    if simulatedPesos < liveEggPrice then
+                        break
+                    end
+
+                    BuyEggRemote:FireServer(egg.id)
+                    simulatedPesos = simulatedPesos - liveEggPrice
+                    countBought = countBought + 1
+                    totalSniped = totalSniped + 1
+
+                    Notify("Eggs", string.format("Bought %s for ₱%s!", egg.disp, formatPriceShort(liveEggPrice)), 2.5)
+                    task.wait(Settings.SnipeDelay)
+                end
+
+                if countBought > 0 then
+                    Settings.CurrentEggStock[egg.id] = math.max(0, (Settings.CurrentEggStock[egg.id] or 0) - countBought)
                 end
             end
         end
-
-        if #ripePrompts > 0 then
-            local primaryPart = plant.PrimaryPart or (ripePrompts[1] and ripePrompts[1].part)
-            if primaryPart then
-                local dist = (primaryPart.Position - hrp.Position).Magnitude
-                table.insert(clusters, {
-                    plant = plant,
-                    primaryPart = primaryPart,
-                    prompts = ripePrompts,
-                    dist = dist,
-                })
-            end
-        end
-    end
-
-    -- Nearest plants first
-    table.sort(clusters, function(a, b)
-        return a.dist < b.dist
     end)
 
-    return clusters
+    Settings.RunningEggSnipe = false
+    return totalSniped
 end
 
 local function executeSellCycle(isManual)
     if Settings.RunningSell or Settings.CleaningUp then return false end
     if not SellAllRemote or not GetSellTotalRemote then return false end
-    Settings.RunningSell = true
 
+    -- If currently in the middle of teleporting harvest pass, wait briefly for it to return
+    if Settings.RunningHarvest then
+        return false
+    end
+
+    Settings.RunningSell = true
     local sellSuccess = false
 
-    local success, err = pcall(function()
+    local _ok, _execErr = pcall(function()
         local char = LocalPlayer.Character
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
         if not hrp then return end
@@ -592,20 +889,22 @@ local function executeSellCycle(isManual)
             end
         end
 
-        local sellPos = sellProx and sellProx.Position or Vector3.new(-374.4, 22.15, 609.3)
         local originalCFrame = hrp.CFrame
+        local sellPos = sellProx and sellProx.Position or Vector3.new(-374.4, 22.15, 609.3)
 
-        -- Teleport safely in front of Buyer NPC
-        hrp.CFrame = CFrame.new(sellPos + Vector3.new(0, 1.5, 3), sellPos)
-        task.wait(0.08)
+        -- Teleport safely directly in front of Buyer NPC
+        hrp.CFrame = CFrame.new(sellPos + Vector3.new(0, 1.5, 2), sellPos)
+        task.wait(0.2) -- Replication sync so the server acknowledges the position
 
         -- Fire sell remote
         SellAllRemote:FireServer()
         task.wait(0.2)
 
-        -- Smoothly return to farm plot and restore camera
+        -- Smoothly return to original position and restore camera
         if hrp and hrp.Parent then
             pcall(function()
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                hrp.AssemblyAngularVelocity = Vector3.zero
                 hrp.CFrame = originalCFrame
             end)
             task.wait(0.04)
@@ -615,6 +914,19 @@ local function executeSellCycle(isManual)
         sellSuccess = true
         local earnedCash = (Format and Format.CashFull and Format.CashFull(sellData.Total or 0)) or tostring(sellData.Total or 0)
         Notify("Auto Sell", string.format("Sold %d plants for ₱%s!", currentCount, earnedCash), 3)
+
+        -- Immediately trigger land upgrade check if enabled (synergy with cash gained)
+        if (Settings.AutoUpgradePlot or Settings.AutoUpgradeHouse) and not Settings.CleaningUp and not Settings.RunningLandUpgrade then
+            task.spawn(function()
+                task.wait(0.3)
+                if Settings.AutoUpgradePlot then
+                    executeLandUpgrade("Plot", false)
+                end
+                if Settings.AutoUpgradeHouse then
+                    executeLandUpgrade("House", false)
+                end
+            end)
+        end
     end)
 
     Settings.RunningSell = false
@@ -622,67 +934,88 @@ local function executeSellCycle(isManual)
 end
 
 local function executeHarvestPass(isManual)
-    if Settings.RunningHarvest or Settings.CleaningUp then return 0 end
+    if Settings.RunningHarvest or Settings.RunningSell or Settings.CleaningUp then return 0 end
     Settings.RunningHarvest = true
 
     local harvestedCount = 0
 
-    local success, err = pcall(function()
+    local _ok, _err = pcall(function()
         local char = LocalPlayer.Character
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
         if not hrp then return end
 
-        local clusters = getFarmPlantClusters()
-        if #clusters == 0 then
+        local myFarm = getPlayerFarm()
+        if not myFarm then return end
+
+        local plantsFolder = myFarm:FindFirstChild("Plants")
+        if not plantsFolder then return end
+
+        -- Fast group ripe prompts by plant model for instant multi-picking
+        local ripePlants = {}
+        for _, plant in ipairs(plantsFolder:GetChildren()) do
+            local prompts = {}
+            for _, desc in ipairs(plant:GetDescendants()) do
+                if desc:IsA("ProximityPrompt") and desc.ActionText == "Pick" and desc.Enabled then
+                    local part = desc.Parent
+                    if part and part:IsA("BasePart") then
+                        table.insert(prompts, {
+                            prompt = desc,
+                            part = part,
+                        })
+                    end
+                end
+            end
+            if #prompts > 0 then
+                table.insert(ripePlants, {
+                    plant = plant,
+                    prompts = prompts,
+                    firstPart = prompts[1].part,
+                    dist = (prompts[1].part.Position - hrp.Position).Magnitude
+                })
+            end
+        end
+
+        if #ripePlants == 0 then
             return
         end
 
+        -- Sort nearest plant first for seamless navigation
+        table.sort(ripePlants, function(a, b)
+            return a.dist < b.dist
+        end)
+
+        -- Save where the player is currently standing
         local originalCFrame = hrp.CFrame
         local moved = false
 
-        for _, cluster in ipairs(clusters) do
+        for _, plantData in ipairs(ripePlants) do
             if not Settings.AutoHarvestEnabled and not isManual then break end
             if Settings.CleaningUp then break end
 
-            local targetPart = cluster.primaryPart or (cluster.prompts[1] and cluster.prompts[1].part)
-            if targetPart and targetPart.Parent and hrp and hrp.Parent then
-                local currentHrpPos = hrp.Position
-                local targetPos = targetPart.Position
-                local horizDiff = Vector3.new(currentHrpPos.X - targetPos.X, 0, currentHrpPos.Z - targetPos.Z)
-                local dist = horizDiff.Magnitude
+            local firstPart = plantData.firstPart
+            if firstPart and firstPart.Parent and hrp and hrp.Parent then
+                -- Teleport directly onto the plant's fruit cluster
+                hrp.CFrame = CFrame.new(firstPart.Position + Vector3.new(0, 0.5, 0))
+                moved = true
+                task.wait() -- Single frame yield: ultra-fast yet reliable
 
-                -- Stand 4.5 studs outside the tree trunk in the approach direction to prevent camera clipping inside tree trunk
-                local dir
-                if dist > 0.5 then
-                    dir = horizDiff.Unit
-                else
-                    dir = Vector3.new(0, 0, 1)
-                end
+                for _, pData in ipairs(plantData.prompts) do
+                    local prompt = pData.prompt
+                    local part = pData.part
+                    if prompt and prompt.Parent and prompt.Enabled and hrp and hrp.Parent then
+                        -- If fruit is farther out on wide branches, hop directly to it
+                        if part and (part.Position - hrp.Position).Magnitude > 8 then
+                            hrp.CFrame = CFrame.new(part.Position + Vector3.new(0, 0.5, 0))
+                        end
 
-                local standPos = Vector3.new(targetPos.X + dir.X * 4.5, currentHrpPos.Y, targetPos.Z + dir.Z * 4.5)
-                local standDist = (standPos - currentHrpPos).Magnitude
-
-                -- Teleport safely outside the plant
-                if standDist > 6 then
-                    hrp.CFrame = CFrame.lookAt(standPos, Vector3.new(targetPos.X, standPos.Y, targetPos.Z))
-                    moved = true
-                    task.wait(0.04) -- replication sync
-                end
-
-                -- Pick all ripe fruits on this plant with NO delay
-                for _, item in ipairs(cluster.prompts) do
-                    if not Settings.AutoHarvestEnabled and not isManual then break end
-                    if Settings.CleaningUp then break end
-
-                    local prompt = item.prompt
-                    if prompt and prompt.Parent and prompt.Enabled then
-                        pcall(function()
-                            prompt:InputHoldBegin()
-                            prompt:InputHoldEnd()
-                        end)
                         if fireproximityprompt then
+                            fireproximityprompt(prompt)
+                        else
                             pcall(function()
-                                fireproximityprompt(prompt, 0)
+                                prompt:InputHoldBegin()
+                                task.wait(prompt.HoldDuration or 0)
+                                prompt:InputHoldEnd()
                             end)
                         end
                         harvestedCount = harvestedCount + 1
@@ -691,27 +1024,27 @@ local function executeHarvestPass(isManual)
             end
         end
 
-        -- Smoothly restore player to initial position and unstick camera
+        -- Smoothly restore player to the exact spot where they were standing
         if moved and hrp and hrp.Parent then
             pcall(function()
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                hrp.AssemblyAngularVelocity = Vector3.zero
                 hrp.CFrame = originalCFrame
             end)
+            if hum and hum.Health > 0 then
+                hum.PlatformStand = false
+                hum.Sit = false
+            end
             task.wait(0.04)
             unstickCamera()
         end
     end)
 
-    -- Guaranteed reset so harvest loop never gets stuck
     Settings.RunningHarvest = false
 
-    if not success then
-        warn("[YuriGFX] Harvest execution error: " .. tostring(err))
-    end
-
-    -- Trigger Auto Sell pass if enabled
-    if Settings.AutoSellEnabled and not Settings.CleaningUp then
+    -- Immediately trigger Auto Sell right after harvest finishes so inventory is sold without delay
+    if Settings.AutoSellEnabled and not Settings.CleaningUp and not Settings.RunningSell then
         task.spawn(function()
-            task.wait(0.1)
             executeSellCycle(false)
         end)
     end
@@ -719,17 +1052,31 @@ local function executeHarvestPass(isManual)
     return harvestedCount
 end
 
+local function ensureHarvestLoop()
+    if Settings.HarvestLoopRunning then return end
+    Settings.HarvestLoopRunning = true
+    task.spawn(function()
+        while Settings.AutoHarvestEnabled and not Settings.CleaningUp do
+            pcall(function()
+                executeHarvestPass(false)
+            end)
+            task.wait(0.5)
+        end
+        Settings.HarvestLoopRunning = false
+    end)
+end
+
 -- =========================================================================
--- 7. BUILD YuriGFX UI (Main Tab Only)
+-- 7. BUILD YuriGFX UI (Main and Upgrader Tabs)
 -- =========================================================================
 local Category = UI:create_category("YuriGFX")
 
--- MAIN TAB
+-- -------------------------------------------------------------------------
+-- TAB 1: MAIN
+-- -------------------------------------------------------------------------
 local MainTab = Category:create_tab("Main", "76499042599127")
 
--- -------------------------------------------------------------------------
 -- LEFT COLUMN: SEEDS (Auto Buy Controls)
--- -------------------------------------------------------------------------
 local SeedsGroup = MainTab:create_group("Seeds", "left")
 
 SeedsGroup:create_toggle("AutoBuyMaster", {
@@ -746,10 +1093,10 @@ SeedsGroup:create_toggle("AutoBuyMaster", {
     end
 })
 
--- Multi-selection Dropdown: options show prices like "Calamansi (₱7)", header displays clean "Calamansi, Corn" or "None"
+-- Multi-selection Dropdown: options formatted cleanly with compact price e.g. "Coffee (₱77k)", "Java Plum (₱100k)"
 SeedsGroup:create_dropdown("TargetSeedsDropdown", {
     title = "Target Seeds",
-    options = dropdownOptions,
+    options = seedOptionStrings,
     multi = true,
     default = {}, -- Empty by default: user manually chooses what to buy
     callback = function(selected)
@@ -792,9 +1139,7 @@ SeedsGroup:create_toggle("BuyOnRestockToggle", {
     end
 })
 
--- -------------------------------------------------------------------------
--- RIGHT COLUMN: PLANTS (Automatic Farm-Plot Harvesting)
--- -------------------------------------------------------------------------
+-- RIGHT COLUMN: PLANTS (Automatic Farm-Plot Harvesting & Selling)
 local PlantsGroup = MainTab:create_group("Plants", "right")
 
 PlantsGroup:create_toggle("AutoHarvestMaster", {
@@ -804,14 +1149,7 @@ PlantsGroup:create_toggle("AutoHarvestMaster", {
         Settings.AutoHarvestEnabled = val
         if val then
             Notify("Plants", "Auto Harvest activated on your plot!", 2)
-            task.spawn(function()
-                while Settings.AutoHarvestEnabled and not Settings.CleaningUp do
-                    pcall(function()
-                        executeHarvestPass(false)
-                    end)
-                    task.wait(0.5)
-                end
-            end)
+            ensureHarvestLoop()
         else
             Notify("Plants", "Auto Harvest paused.", 2)
         end
@@ -834,30 +1172,62 @@ PlantsGroup:create_toggle("AutoSellMaster", {
     end
 })
 
+local sellSlider
+
+local function updateSliderVisibility(chosen)
+    local isCustom = (chosen == "Custom" or chosen == "Custom (Slider)")
+    if sellSlider and typeof(sellSlider) == "Instance" then
+        sellSlider.Visible = isCustom
+    end
+    if PlantsGroup and PlantsGroup._frame then
+        for _, child in ipairs(PlantsGroup._frame:GetChildren()) do
+            if child:IsA("Frame") then
+                local lbl = child:FindFirstChildWhichIsA("TextLabel")
+                if lbl and (lbl.Text == "Custom Threshold" or lbl.Text == "Sell Threshold") then
+                    child.Visible = isCustom
+                    break
+                end
+            end
+        end
+    end
+end
+
+-- Threshold Preset title: "AutoSell When reach out in ..."
 PlantsGroup:create_dropdown("SellThresholdPreset", {
-    title = "Threshold Preset",
-    options = { "250 Plants", "500 Plants", "600 Plants", "Custom (Slider)" },
+    title = "AutoSell When reach out in ...",
+    options = { "250 Plants", "500 Plants", "600 Plants", "Custom" },
     multi = false,
     default = "250 Plants",
     callback = function(chosen)
         if chosen == "250 Plants" then
             Settings.AutoSellThreshold = 250
-            Notify("Auto Sell", "Threshold set to 250 plants.", 2)
+            updateSliderVisibility(chosen)
+            Notify("Auto Sell", "AutoSell threshold set to 250 plants.", 2)
         elseif chosen == "500 Plants" then
             Settings.AutoSellThreshold = 500
-            Notify("Auto Sell", "Threshold set to 500 plants.", 2)
+            updateSliderVisibility(chosen)
+            Notify("Auto Sell", "AutoSell threshold set to 500 plants.", 2)
         elseif chosen == "600 Plants" then
             Settings.AutoSellThreshold = 600
-            Notify("Auto Sell", "Threshold set to 600 plants.", 2)
-        elseif chosen == "Custom (Slider)" then
+            updateSliderVisibility(chosen)
+            Notify("Auto Sell", "AutoSell threshold set to 600 plants.", 2)
+        elseif chosen == "Custom" or chosen == "Custom (Slider)" then
             Settings.AutoSellThreshold = Settings.CustomThreshold or 250
+            updateSliderVisibility(chosen)
             Notify("Auto Sell", "Using custom threshold: " .. tostring(Settings.AutoSellThreshold) .. " plants.", 2)
+        end
+
+        -- Immediately check if current inventory satisfies new threshold
+        if Settings.AutoSellEnabled and not Settings.RunningSell and not Settings.RunningHarvest then
+            task.spawn(function()
+                executeSellCycle(false)
+            end)
         end
     end
 })
 
-PlantsGroup:create_slider("SellThresholdSlider", {
-    title = "Sell Threshold",
+sellSlider = PlantsGroup:create_slider("SellThresholdSlider", {
+    title = "Custom Threshold",
     minimum = 25,
     maximum = 1000,
     default = 250,
@@ -866,14 +1236,168 @@ PlantsGroup:create_slider("SellThresholdSlider", {
         val = math.floor(tonumber(val) or 250)
         Settings.CustomThreshold = val
         Settings.AutoSellThreshold = val
+
+        -- Immediately trigger sell if inventory is already at or above new custom threshold
+        if Settings.AutoSellEnabled and not Settings.RunningSell and not Settings.RunningHarvest then
+            task.spawn(function()
+                executeSellCycle(false)
+            end)
+        end
     end
 })
+
+-- Only show slider if dropdown is Custom! Hide by default.
+updateSliderVisibility("250 Plants")
 
 PlantsGroup:create_button("SellNowButton", {
     title = "Sell All Now",
     callback = function()
         task.spawn(function()
             executeSellCycle(true)
+        end)
+    end
+})
+
+-- -------------------------------------------------------------------------
+-- LEFT COLUMN: LAND UPGRADES (Inside Main Tab)
+-- -------------------------------------------------------------------------
+local LandGroup = MainTab:create_group("Land Upgrades", "left")
+
+LandGroup:create_toggle("AutoUpgradePlotToggle", {
+    title = "Auto Backyard",
+    default = false,
+    callback = function(val)
+        Settings.AutoUpgradePlot = val
+        if val then
+            Notify("Land Upgrades", "Auto Backyard enabled!", 2)
+            task.spawn(function()
+                executeLandUpgrade("Plot", false)
+            end)
+        else
+            Notify("Land Upgrades", "Auto Backyard paused.", 2)
+        end
+    end
+})
+
+LandGroup:create_toggle("AutoUpgradeHouseToggle", {
+    title = "Auto House",
+    default = false,
+    callback = function(val)
+        Settings.AutoUpgradeHouse = val
+        if val then
+            Notify("Land Upgrades", "Auto House enabled!", 2)
+            task.spawn(function()
+                executeLandUpgrade("House", false)
+            end)
+        else
+            Notify("Land Upgrades", "Auto House paused.", 2)
+        end
+    end
+})
+
+LandGroup:create_button("UpgradePlotButton", {
+    title = "Upgrade Backyard Now",
+    callback = function()
+        task.spawn(function()
+            executeLandUpgrade("Plot", true)
+        end)
+    end
+})
+
+LandGroup:create_button("UpgradeHouseButton", {
+    title = "Upgrade House Now",
+    callback = function()
+        task.spawn(function()
+            executeLandUpgrade("House", true)
+        end)
+    end
+})
+
+LandGroup:create_button("CheckUpgradeStatusButton", {
+    title = "Check Upgrade Costs",
+    callback = function()
+        task.spawn(function()
+            local success, upData = pcall(function()
+                return FarmGetUpgradeRemote:InvokeServer()
+            end)
+            if success and type(upData) == "table" then
+                local plotInfo = upData.Plot
+                local houseInfo = upData.House
+                local pText = (plotInfo and type(plotInfo) == "table") and (plotInfo.Maxed and "Maxed" or string.format("%s (₱%s)", plotInfo.NextName or "Next", formatPriceShort(plotInfo.Cost or 0))) or "N/A"
+                local hText = (houseInfo and type(houseInfo) == "table") and (houseInfo.Maxed and "Maxed" or string.format("%s (₱%s)", houseInfo.NextName or "Next", formatPriceShort(houseInfo.Cost or 0))) or "N/A"
+                Notify("Upgrade Status", string.format("Backyard: %s\nHouse: %s", pText, hText), 4)
+            else
+                Notify("Upgrade Status", "Failed to retrieve upgrade information.", 2.5)
+            end
+        end)
+    end
+})
+
+-- -------------------------------------------------------------------------
+-- RIGHT COLUMN: EGGS (Inside Main Tab)
+-- -------------------------------------------------------------------------
+local EggGroup = MainTab:create_group("Eggs", "right")
+
+EggGroup:create_toggle("EggSniperMasterToggle", {
+    title = "Auto Buy",
+    default = false,
+    callback = function(val)
+        Settings.EggSniperEnabled = val
+        if val then
+            Notify("Eggs", "Egg Auto Buy activated! Monitoring stock...", 2)
+            task.spawn(function()
+                executeEggSnipe(false)
+            end)
+        else
+            Notify("Eggs", "Egg Auto Buy paused.", 2)
+        end
+    end
+})
+
+local defaultSelectedEggs = {}
+for i = 1, math.min(3, #EggList) do
+    table.insert(defaultSelectedEggs, EggList[i].label)
+end
+
+EggGroup:create_dropdown("TargetEggsDropdown", {
+    title = "Target Eggs",
+    options = eggOptionStrings,
+    multi = true,
+    default = defaultSelectedEggs,
+    callback = function(selected)
+        if type(selected) == "table" then
+            Settings.SelectedEggs = selected
+        end
+    end
+})
+
+EggGroup:create_toggle("SnipeOnRestockToggle", {
+    title = "Buy On Restock",
+    default = true,
+    callback = function(val)
+        Settings.SnipeOnRestock = val
+    end
+})
+
+EggGroup:create_slider("SnipeDelaySlider", {
+    title = "Buy Delay",
+    minimum = 0.05,
+    maximum = 1.0,
+    default = 0.15,
+    rounding = true,
+    callback = function(val)
+        Settings.SnipeDelay = val
+    end
+})
+
+EggGroup:create_button("SnipeNowButton", {
+    title = "Buy Available Now",
+    callback = function()
+        task.spawn(function()
+            local sniped = executeEggSnipe(true)
+            if sniped == 0 then
+                Notify("Eggs", "No target eggs available or affordable right now.", 2.5)
+            end
         end)
     end
 })
@@ -899,11 +1423,52 @@ local restockConn = StockChangedRemote.OnClientEvent:Connect(function(newStock, 
 end)
 table.insert(Settings.ActiveConnections, restockConn)
 
+if EggStockChangedRemote then
+    local eggRestockConn = EggStockChangedRemote.OnClientEvent:Connect(function(newStock, nextRestock)
+        Settings.CurrentEggStock = newStock or {}
+        if nextRestock then
+            Settings.NextEggRestock = nextRestock
+        end
+
+        if Settings.EggSniperEnabled and Settings.SnipeOnRestock then
+            Notify("Egg Restock", "Egg stock refreshed! Sniping target eggs...", 2)
+            task.spawn(function()
+                task.wait(0.05)
+                pcall(function()
+                    executeEggSnipe(false)
+                end)
+            end)
+        end
+    end)
+    table.insert(Settings.ActiveConnections, eggRestockConn)
+end
+
+if FarmUpgradeRemote then
+    local farmUpgradeConn = FarmUpgradeRemote.OnClientEvent:Connect(function(track, success)
+        if success then
+            local trackTitle = (track == "Plot" and "Backyard") or tostring(track)
+            Notify("Land Upgrade", string.format("%s was upgraded successfully!", trackTitle), 3.5)
+        end
+    end)
+    table.insert(Settings.ActiveConnections, farmUpgradeConn)
+end
+
+if BuyEggRemote then
+    local buyEggConn = BuyEggRemote.OnClientEvent:Connect(function(eggId, success, errMsg)
+        if not success and errMsg then
+            warn("[Egg Sniper]", eggId, errMsg)
+        end
+    end)
+    table.insert(Settings.ActiveConnections, buyEggConn)
+end
+
 -- Recover state on character respawn
 local charConn = LocalPlayer.CharacterAdded:Connect(function()
     Settings.RunningHarvest = false
     Settings.RunningPass = false
     Settings.RunningSell = false
+    Settings.RunningLandUpgrade = false
+    Settings.RunningEggSnipe = false
     task.wait(1)
     unstickCamera()
 end)
@@ -938,13 +1503,42 @@ task.spawn(function()
     end
 end)
 
--- Periodic Auto Sell daemon: triggers sell if player inventory reaches or exceeds threshold
+-- Responsive Auto Sell daemon: triggers sell if player inventory reaches or exceeds threshold
+task.spawn(function()
+    while not Settings.CleaningUp do
+        task.wait(1.0)
+        if Settings.AutoSellEnabled and not Settings.RunningSell and not Settings.RunningHarvest then
+            pcall(function()
+                executeSellCycle(false)
+            end)
+        end
+    end
+end)
+
+-- Auto Land Upgrades background daemon
 task.spawn(function()
     while not Settings.CleaningUp do
         task.wait(2.5)
-        if Settings.AutoSellEnabled and not Settings.RunningHarvest and not Settings.RunningSell then
+        if (Settings.AutoUpgradePlot or Settings.AutoUpgradeHouse) and not Settings.RunningLandUpgrade and not Settings.RunningHarvest and not Settings.RunningSell then
             pcall(function()
-                executeSellCycle(false)
+                if Settings.AutoUpgradePlot then
+                    executeLandUpgrade("Plot", false)
+                end
+                if Settings.AutoUpgradeHouse then
+                    executeLandUpgrade("House", false)
+                end
+            end)
+        end
+    end
+end)
+
+-- Egg Sniper periodic background daemon
+task.spawn(function()
+    while not Settings.CleaningUp do
+        task.wait(1.5)
+        if Settings.EggSniperEnabled and not Settings.RunningEggSnipe and not Settings.RunningHarvest and not Settings.RunningSell then
+            pcall(function()
+                executeEggSnipe(false)
             end)
         end
     end
@@ -953,12 +1547,7 @@ end)
 -- Automatically start Auto Harvest loop on script load
 task.spawn(function()
     task.wait(0.4)
-    while Settings.AutoHarvestEnabled and not Settings.CleaningUp do
-        pcall(function()
-            executeHarvestPass(false)
-        end)
-        task.wait(0.5)
-    end
+    ensureHarvestLoop()
 end)
 
 Notify("YuriGFX", "Main loaded! Press Left Shift to unload, Insert to toggle.", 3.5)
