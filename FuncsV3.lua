@@ -1,12 +1,12 @@
 local FuncsV3 = {}
-local SaveConfig = {}
+local SaveConfig = {} -- FIX: was nil, which made Dropdown / "Save" defaults error when SetTable() wasn't called
 
 local function Checker(Val, Val1, Val2)
   return typeof(Val) == Val1 and Val or Val2
 end
 
 function FuncsV3:SetTable(path)
-  SaveConfig = typeof(path) == "table" and path or {}
+  SaveConfig = Checker(path, "table", {})
 end
 
 function FuncsV3:Toggle(Tab, Name, Content, Default, Callback)
@@ -87,6 +87,60 @@ function FuncsV3:Textbox(Tab, Name, Content, Default, Callback)
     Default = _default,
     Callback = Callback
   })
+end
+
+-- ///////////////////////////////////////////////////////////////
+-- NEW helpers (additive - nothing above was changed)
+-- ///////////////////////////////////////////////////////////////
+
+-- FuncsV3:Slider(Section, "Walk Speed", "Set your speed", 1, 16, 200, 16, function(value) end)
+-- Default can also be "Save" to restore the value from the table given to SetTable()
+function FuncsV3:Slider(Tab, Name, Content, Increment, Min, Max, Default, Callback)
+  Name = Checker(Name, "string", tostring(Name))
+  Content = Checker(Content, "string", tostring(Content))
+  Increment = Checker(Increment, "number", 1)
+  Min = Checker(Min, "number", 0)
+  Max = Checker(Max, "number", 100)
+  Callback = Checker(Callback, "function", function() end)
+
+  local _default = Default == "Save"
+  and Checker(SaveConfig[Name], "number", Min)
+  or Checker(Default, "number", Min)
+
+  return Tab:AddSlider({
+    Title = Name,
+    Content = Content,
+    Increment = Increment,
+    Min = Min,
+    Max = Max,
+    Default = _default,
+    Callback = Callback
+  })
+end
+
+-- FuncsV3:Paragraph(Section, "Info", "Some longer text that wraps onto several lines")
+function FuncsV3:Paragraph(Tab, Name, Content)
+  Name = Checker(Name, "string", tostring(Name))
+  Content = Checker(Content, "string", tostring(Content))
+
+  return Tab:AddParagraph({
+    Title = Name,
+    Content = Content
+  })
+end
+
+-- FuncsV3:Separator(Section, "Misc")
+function FuncsV3:Separator(Tab, Name)
+  Name = Checker(Name, "string", tostring(Name))
+
+  return Tab:AddSeperator({
+    Title = Name
+  })
+end
+
+-- FuncsV3:Line(Section)
+function FuncsV3:Line(Tab)
+  return Tab:AddLine()
 end
 
 return FuncsV3
