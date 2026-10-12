@@ -4,6 +4,7 @@ local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local VirtualUser = game:GetService("VirtualUser")
+local TextService = game:GetService("TextService")
 
 local Custom = {} do
   Custom.ColorRGB = Color3.fromRGB(250, 7, 7)
@@ -28,6 +29,28 @@ local Custom = {} do
       task.wait(1)
       VirtualUser:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
     end)
+  end
+
+  -- FIX: reliable line counter for "Content" captions.
+  -- The old code used TextBounds / AbsoluteSize which returns 0 lines while the font is still
+  -- loading or the label has not been laid out yet. That produced a 45px element where the
+  -- caption was glued to the title ("sticky"). This always returns at least 1 line, so every
+  -- element (Toggle / Button / Input / Slider / Dropdown / Paragraph) gets the same spacing.
+  function Custom:GetLines(Label)
+    local Width = Label.AbsoluteSize.X
+    if Width <= 0 or Label.Text == "" then
+      return 1
+    end
+
+    local Success, Bounds = pcall(function()
+      return TextService:GetTextSize(Label.Text, Label.TextSize, Label.Font, Vector2.new(100000, 100000))
+    end)
+
+    if not Success or not Bounds then
+      return 1
+    end
+
+    return math.max(1, math.ceil(Bounds.X / Width))
   end
 end
 
@@ -508,6 +531,7 @@ function Speed_Library:CreateWindow(Config)
     BackgroundTransparency = 0.9990000128746033,
     BorderColor3 = Color3.fromRGB(0, 0, 0),
     BorderSizePixel = 0,
+    ClipsDescendants = true,
     Position = UDim2.new(0, 9, 0, 50),
     Size = UDim2.new(0, TabWidth, 1, -59),
     Name = "LayersTab"
@@ -581,8 +605,12 @@ function Speed_Library:CreateWindow(Config)
     EasingStyle = Enum.EasingStyle.Quad
   }, LayersFolder)
 
+  -- FIX: the tab list now sizes its canvas automatically. The old manual UpdateSize() counted
+  -- an extra 3px per tab (the list padding is 0), so the tab list could be scrolled past its
+  -- content and the selected-tab indicator drifted out of place.
   local ScrollTab = Custom:Create("ScrollingFrame", {
-    CanvasSize = UDim2.new(0, 0, 2.10000002, 0),
+    CanvasSize = UDim2.new(0, 0, 0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
     ScrollBarImageColor3 = Color3.fromRGB(0, 0, 0),
     ScrollBarThickness = 0,
     Active = true,
@@ -598,21 +626,6 @@ function Speed_Library:CreateWindow(Config)
     Padding = UDim.new(0, 0),
     SortOrder = Enum.SortOrder.LayoutOrder
   }, ScrollTab)
-
-  local function UpdateSize()
-    local _Total = 0
-
-		for _, v in pairs(ScrollTab:GetChildren()) do
-			if v.Name ~= "UIListLayout" then
-				_Total = _Total + 3 + v.Size.Y.Offset
-			end
-		end
-
-		ScrollTab.CanvasSize = UDim2.new(0, 0, 0, _Total)
-  end
-
-  ScrollTab.ChildAdded:Connect(UpdateSize)
-  ScrollTab.ChildRemoved:Connect(UpdateSize)
 
   Min.Activated:Connect(function()
 		CircleClick(Min, Player:GetMouse().X, Player:GetMouse().Y)
@@ -756,16 +769,126 @@ function Speed_Library:CreateWindow(Config)
     Parent = DropdownFolder
   })
 
+  -- /// Tab state (FIX: one selection routine + one indicator per window)
+  --
+  -- The old code kept the red indicator ("ChooseFrame") as a child of the FIRST tab, searched for
+  -- it on every click, relied on task.wait() before it updated the page title, and used a
+  -- LayoutOrder comparison to decide whether to switch. Fast clicks / scrolling / icon-less
+  -- tabs could leave the indicator, highlight, title and page out of sync.
+  -- Now every click goes through SelectTab(), which updates everything in one place.
+
+  local TabList = {}
+  local SelectedTab = nil
+  local TabSwitchToken = 0
+
+  local TabIndicator = Custom:Create("Frame", {
+    BackgroundColor3 = Custom.ColorRGB,
+    BorderColor3 = Color3.fromRGB(0, 0, 0),
+    BorderSizePixel = 0,
+    Position = UDim2.new(0, 2, 0, 9),
+    Size = UDim2.new(0, 1, 0, 12),
+    Visible = false,
+    ZIndex = 3,
+    Name = "ChooseFrame",
+  }, LayersTab)
+
+  Custom:Create("UIStroke", {
+    Color = Custom.ColorRGB,
+    Thickness = 1.6,
+  }, TabIndicator)
+
+  Custom:Create("UICorner", {}, TabIndicator)
+
+  local IndicatorMoveTween = nil
+
+  local function GetIndicatorPosition(TabData)
+    local Y = TabData.Frame.AbsolutePosition.Y - LayersTab.AbsolutePosition.Y + 9
+    return UDim2.new(0, 2, 0, Y)
+  end
+
+  local function PlaceIndicator(Animated)
+    if not SelectedTab then return end
+
+    if IndicatorMoveTween then
+      IndicatorMoveTween:Cancel()
+      IndicatorMoveTween = nil
+    end
+
+    TabIndicator.Visible = true
+
+    if Animated then
+      IndicatorMoveTween = TweenService:Create(TabIndicator, TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), {Position = GetIndicatorPosition(SelectedTab)})
+      IndicatorMoveTween:Play()
+    else
+      TabIndicator.Position = GetIndicatorPosition(SelectedTab)
+    end
+  end
+
+  local function SelectTab(TabData, Instant)
+    if not TabData then return end
+    if SelectedTab == TabData and not Instant then return end
+
+    SelectedTab = TabData
+    TabSwitchToken = TabSwitchToken + 1
+    local MyToken = TabSwitchToken
+
+    -- title + page are updated immediately (no yielding before them)
+    NameTab.Text = TabData.Name
+    pcall(function()
+      LayersPageLayout:JumpTo(TabData.Page)
+    end)
+
+    -- highlight
+    for _, Other in ipairs(TabList) do
+      local IsSelected = Other == TabData
+
+      if Instant then
+        Other.Frame.BackgroundTransparency = IsSelected and 0.92 or 0.999
+      else
+        TweenService:Create(Other.Frame, TweenInfo.new(IsSelected and 0.6 or 0.2, Enum.EasingStyle.Back, Enum.EasingDirection.InOut), {
+          BackgroundTransparency = IsSelected and 0.92 or 0.999
+        }):Play()
+      end
+    end
+
+    -- indicator
+    if Instant then
+      TabIndicator.Size = UDim2.new(0, 1, 0, 12)
+      PlaceIndicator(false)
+    else
+      PlaceIndicator(true)
+
+      task.spawn(function()
+        TweenService:Create(TabIndicator, TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), {Size = UDim2.new(0, 1, 0, 20)}):Play()
+
+        task.wait(0.2)
+        if MyToken ~= TabSwitchToken then return end
+
+        TweenService:Create(TabIndicator, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), {Size = UDim2.new(0, 1, 0, 12)}):Play()
+      end)
+    end
+  end
+
+  -- keep the indicator glued to the selected tab when the list scrolls / lays out / the window moves
+  ScrollTab:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
+    PlaceIndicator(false)
+  end)
+
+  LayersTab:GetPropertyChangedSignal("AbsolutePosition"):Connect(function()
+    if SelectedTab and not IndicatorMoveTween then
+      PlaceIndicator(false)
+    end
+  end)
+
   -- /// Create Tab
 
   local Tabs = {}
   local CountTab = 0
   local CountDropdown = 0
-  local CurrentTabOrder = 0
-  local TabClickToken = 0
   function Tabs:CreateTab(Config)
     local _Name = Config[1] or Config.Name or "" 
     local Icon = Config[2] or Config.Icon or ""
+    local HasIcon = Icon ~= ""
     
     local ScrolLayers = Custom:Create("ScrollingFrame", {
 			ScrollBarImageColor3 = Color3.fromRGB(80, 80, 80),
@@ -789,7 +912,7 @@ function Speed_Library:CreateWindow(Config)
 
     local Tab = Custom:Create("Frame", {
 			BackgroundColor3 = Color3.fromRGB(255, 255, 255),
-			BackgroundTransparency = CountTab == 0 and 0.92 or 0.999,
+			BackgroundTransparency = 0.999,
 			BorderColor3 = Color3.fromRGB(0, 0, 0),
 			BorderSizePixel = 0,
 			LayoutOrder = CountTab,
@@ -817,6 +940,7 @@ function Speed_Library:CreateWindow(Config)
       Name = "TabButton",
     }, Tab)
 
+    -- FIX: tabs without an icon no longer leave an empty 30px gap before the text
     Custom:Create("TextLabel", {
       Font = Enum.Font.GothamBold,
       Text = _Name,
@@ -828,12 +952,13 @@ function Speed_Library:CreateWindow(Config)
       BorderColor3 = Color3.fromRGB(0, 0, 0),
       BorderSizePixel = 0,
       Size = UDim2.new(1, 0, 1, 0),
-      Position = UDim2.new(0, 30, 0, 0),
+      Position = UDim2.new(0, HasIcon and 30 or 10, 0, 0),
       Name = "TabName",
     }, Tab)
 
     Custom:Create("ImageLabel", {
       Image = Icon,
+      Visible = HasIcon,
       BackgroundColor3 = Color3.fromRGB(255, 255, 255),
       BackgroundTransparency = 0.999,
       BorderColor3 = Color3.fromRGB(0, 0, 0),
@@ -843,78 +968,24 @@ function Speed_Library:CreateWindow(Config)
       Name = "FeatureImg",
     }, Tab)
 
-    if CountTab == 0 then
-      LayersPageLayout:JumpToIndex(0)
-      NameTab.Text = _Name
-  
-      local ChooseFrame = Custom:Create("Frame", {
-        BackgroundColor3 = Custom.ColorRGB,
-        BorderColor3 = Color3.fromRGB(0, 0, 0),
-        BorderSizePixel = 0,
-        Position = UDim2.new(0, 2, 0, 9),
-        Size = UDim2.new(0, 1, 0, 12),
-        Name = "ChooseFrame",
-      }, Tab)
-  
-      Custom:Create("UIStroke", {
-        Color = Custom.ColorRGB,
-        Thickness = 1.6,
-      }, ChooseFrame)
-  
-      Custom:Create("UICorner", {}, ChooseFrame)
-    end
+    local TabData = {Frame = Tab, Page = ScrolLayers, Name = _Name}
+    table.insert(TabList, TabData)
+
+    -- indicator follows its tab if the tab moves (initial layout, scrolling, resize)
+    Tab:GetPropertyChangedSignal("AbsolutePosition"):Connect(function()
+      if SelectedTab == TabData then
+        PlaceIndicator(false)
+      end
+    end)
 
     TabButton.Activated:Connect(function()
       CircleClick(TabButton, Player:GetMouse().X, Player:GetMouse().Y)
-      local FrameChoose = nil
-
-      for _, s in pairs(ScrollTab:GetChildren()) do
-        for _, v in pairs(s:GetChildren()) do
-          if v.Name == "ChooseFrame" then
-            FrameChoose = v
-            break
-          end
-        end
-
-        if FrameChoose then break end
-      end
-  
-      if FrameChoose and Tab.LayoutOrder ~= CurrentTabOrder then
-        CurrentTabOrder = Tab.LayoutOrder
-        TabClickToken = TabClickToken + 1
-        local MyToken = TabClickToken
-
-        for _, TabFrame in pairs(ScrollTab:GetChildren()) do
-          if TabFrame.Name == "Tab" then
-            TweenService:Create(TabFrame, TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.InOut), {BackgroundTransparency = 0.999}):Play()
-          end
-        end
-  
-        local _TabT = TweenService:Create(Tab, TweenInfo.new(0.6, Enum.EasingStyle.Back, Enum.EasingDirection.InOut), {BackgroundTransparency = 0.92})
-        local _OffsetY = 0
-        for _, OtherTab in pairs(ScrollTab:GetChildren()) do
-          if OtherTab.Name == "Tab" and OtherTab.LayoutOrder < Tab.LayoutOrder then
-            _OffsetY = _OffsetY + OtherTab.Size.Y.Offset
-          end
-        end
-        local _FTween = TweenService:Create(FrameChoose, TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), { Position = UDim2.new(0, 2, 0, 9 + _OffsetY) })
-
-        _TabT:Play()
-        _FTween:Play()
-  
-        LayersPageLayout:JumpToIndex(Tab.LayoutOrder)
-  
-        task.wait(0.05)
-        NameTab.Text = _Name
-  
-        if MyToken ~= TabClickToken then return end
-        TweenService:Create(FrameChoose, TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), {Size = UDim2.new(0, 1, 0, 20)}):Play()
-  
-        task.wait(0.2)
-        if MyToken ~= TabClickToken then return end
-        TweenService:Create(FrameChoose, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), {Size = UDim2.new(0, 1, 0, 12)}):Play()
-      end
+      SelectTab(TabData)
     end)
+
+    if CountTab == 0 then
+      SelectTab(TabData, true)
+    end
 
     --- /// Section
    
@@ -1141,21 +1212,22 @@ function Speed_Library:CreateWindow(Config)
           TextColor3 = Color3.fromRGB(255, 255, 255),
           TextSize = 12,
           TextTransparency = 0.6,
+          TextWrapped = true,
           TextXAlignment = Enum.TextXAlignment.Left,
           TextYAlignment = Enum.TextYAlignment.Bottom,
           BackgroundTransparency = 0.999,
           BorderSizePixel = 0,
           Position = UDim2.new(0, 10, 0, 23),
+          Size = UDim2.new(1, -16, 0, 12),
           Name = "ParagraphContent",
         }, Paragraph)
 
         local function UpdateParagraphSize()
-          ParagraphContent.TextWrapped = false
-          local lineCount = math.ceil(ParagraphContent.TextBounds.X / ParagraphContent.AbsoluteSize.X)
+          local Lines = Custom:GetLines(ParagraphContent)
+          local ContentHeight = 12 + (12 * Lines)
 
-          ParagraphContent.Size = UDim2.new(1, -16, 0, 12 + (12 * lineCount))
-          Paragraph.Size = UDim2.new(1, 0, 0, ParagraphContent.AbsoluteSize.Y + 33)
-          ParagraphContent.TextWrapped = true
+          ParagraphContent.Size = UDim2.new(1, -16, 0, ContentHeight)
+          Paragraph.Size = UDim2.new(1, 0, 0, ContentHeight + 33)
 
           UpdateSizeSection()
         end
@@ -1298,6 +1370,7 @@ function Speed_Library:CreateWindow(Config)
 					TextColor3 = Color3.fromRGB(255, 255, 255),
 					TextSize = 12,
 					TextTransparency = 0.6,
+					TextWrapped = true,
 					TextXAlignment = Enum.TextXAlignment.Left,
 					TextYAlignment = Enum.TextYAlignment.Bottom,
 					BackgroundColor3 = Color3.fromRGB(255, 255, 255),
@@ -1307,13 +1380,13 @@ function Speed_Library:CreateWindow(Config)
 					Size = UDim2.new(1, -100, 0, 12)
 				}, Button)
 
+        -- FIX: same sizing as the Toggle, never fewer than 1 line (no more "sticky" caption)
         local function UpdateButtonSize()
-          ButtonContent.TextWrapped = false
-          local Ratio = ButtonContent.TextBounds.X / ButtonContent.AbsoluteSize.X
+          local Lines = Custom:GetLines(ButtonContent)
+          local ContentHeight = 12 + (12 * Lines)
 
-          ButtonContent.Size = UDim2.new(1, -100, 0, 12 + (12 * math.ceil(Ratio)))
-          Button.Size = UDim2.new(1, 0, 0, ButtonContent.AbsoluteSize.Y + 33)
-          ButtonContent.TextWrapped = true
+          ButtonContent.Size = UDim2.new(1, -100, 0, ContentHeight)
+          Button.Size = UDim2.new(1, 0, 0, ContentHeight + 33)
         end
       
         UpdateButtonSize()
@@ -1409,6 +1482,7 @@ function Speed_Library:CreateWindow(Config)
 					TextSize = 12,
 					TextColor3 = Color3.fromRGB(255, 255, 255),
 					TextTransparency = 0.6,
+					TextWrapped = true,
 					TextXAlignment = Enum.TextXAlignment.Left,
 					TextYAlignment = Enum.TextYAlignment.Bottom,
 					BackgroundColor3 = Color3.fromRGB(255, 255, 255),
@@ -1419,12 +1493,11 @@ function Speed_Library:CreateWindow(Config)
 				}, Toggle)
 				
         local function UpdateToggleSize()
-          ToggleContent.TextWrapped = false
-          local Ratio = ToggleContent.TextBounds.X / ToggleContent.AbsoluteSize.X
+          local Lines = Custom:GetLines(ToggleContent)
+          local ContentHeight = 12 + (12 * Lines)
 
-          ToggleContent.Size = UDim2.new(1, -100, 0, 12 + (12 * math.ceil(Ratio)))
-          Toggle.Size = UDim2.new(1, 0, 0, ToggleContent.AbsoluteSize.Y + 33)
-          ToggleContent.TextWrapped = true
+          ToggleContent.Size = UDim2.new(1, -100, 0, ContentHeight)
+          Toggle.Size = UDim2.new(1, 0, 0, ContentHeight + 33)
         end
       
         UpdateToggleSize()
@@ -1558,6 +1631,7 @@ function Speed_Library:CreateWindow(Config)
 					TextColor3 = Color3.fromRGB(255, 255, 255),
 					TextSize = 12,
 					TextTransparency = 0.6000000238418579,
+					TextWrapped = true,
 					TextXAlignment = Enum.TextXAlignment.Left,
 					TextYAlignment = Enum.TextYAlignment.Bottom,
 					BackgroundColor3 = Color3.fromRGB(255, 255, 255),
@@ -1570,10 +1644,11 @@ function Speed_Library:CreateWindow(Config)
 				}, Slider)
 
         local function UpdateSliderSize()
-          SliderContent.TextWrapped = false
-          SliderContent.Size = UDim2.new(1, -180, 0, 12 + (12 * math.floor(SliderContent.TextBounds.X / SliderContent.AbsoluteSize.X)))
-          Slider.Size = UDim2.new(1, 0, 0, SliderContent.AbsoluteSize.Y + 33)
-          SliderContent.TextWrapped = true
+          local Lines = Custom:GetLines(SliderContent)
+          local ContentHeight = 12 + (12 * Lines)
+
+          SliderContent.Size = UDim2.new(1, -180, 0, ContentHeight)
+          Slider.Size = UDim2.new(1, 0, 0, ContentHeight + 33)
         end
 
         SliderContent:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
@@ -1780,19 +1855,17 @@ function Speed_Library:CreateWindow(Config)
         })
 
         local function UpdateInputSize()
-          local Ratio = InputContent.TextBounds.X / InputContent.AbsoluteSize.X
-          local Calculated = 12 + (12 * math.floor(Ratio))
+          local Lines = Custom:GetLines(InputContent)
+          local ContentHeight = 12 + (12 * Lines)
 
-          InputContent.Size = UDim2.new(1, -180, 0, Calculated)
-          Input.Size = UDim2.new(1, 0, 0, InputContent.AbsoluteSize.Y + 33)
+          InputContent.Size = UDim2.new(1, -180, 0, ContentHeight)
+          Input.Size = UDim2.new(1, 0, 0, ContentHeight + 33)
         end
       
         UpdateInputSize()
       
         InputContent:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
-          InputContent.TextWrapped = false
           UpdateInputSize()
-          InputContent.TextWrapped = true
           UpdateSizeSection()
         end)
 
@@ -1921,18 +1994,18 @@ function Speed_Library:CreateWindow(Config)
           Parent = Dropdown
         })
         
-				DropdownContent.Size = UDim2.new(1, -180, 0, 12 + (12 * (DropdownContent.TextBounds.X // DropdownContent.AbsoluteSize.X)))
-				DropdownContent.TextWrapped = true
-				Dropdown.Size = UDim2.new(1, 0, 0, DropdownContent.AbsoluteSize.Y + 33)
+        local function UpdateDropdownSize()
+          local Lines = Custom:GetLines(DropdownContent)
+          local ContentHeight = 12 + (12 * Lines)
+
+          DropdownContent.Size = UDim2.new(1, -180, 0, ContentHeight)
+          Dropdown.Size = UDim2.new(1, 0, 0, ContentHeight + 33)
+        end
+
+        UpdateDropdownSize()
         
         DropdownContent:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
-          DropdownContent.TextWrapped = false
-            
-					DropdownContent.Size = UDim2.new(1, -180, 0, 12 + (12 * (DropdownContent.TextBounds.X // DropdownContent.AbsoluteSize.X)))
-					Dropdown.Size = UDim2.new(1, 0, 0, DropdownContent.AbsoluteSize.Y + 33)
-            
-          DropdownContent.TextWrapped = true
-
+          UpdateDropdownSize()
           UpdateSizeSection()
         end)
 
