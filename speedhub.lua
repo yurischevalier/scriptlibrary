@@ -761,6 +761,8 @@ function Speed_Library:CreateWindow(Config)
   local Tabs = {}
   local CountTab = 0
   local CountDropdown = 0
+  local CurrentTabOrder = 0
+  local TabClickToken = 0
   function Tabs:CreateTab(Config)
     local _Name = Config[1] or Config.Name or "" 
     local Icon = Config[2] or Config.Icon or ""
@@ -877,7 +879,11 @@ function Speed_Library:CreateWindow(Config)
         if FrameChoose then break end
       end
   
-      if FrameChoose and Tab.LayoutOrder ~= LayersPageLayout.CurrentPage.LayoutOrder then
+      if FrameChoose and Tab.LayoutOrder ~= CurrentTabOrder then
+        CurrentTabOrder = Tab.LayoutOrder
+        TabClickToken = TabClickToken + 1
+        local MyToken = TabClickToken
+
         for _, TabFrame in pairs(ScrollTab:GetChildren()) do
           if TabFrame.Name == "Tab" then
             TweenService:Create(TabFrame, TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.InOut), {BackgroundTransparency = 0.999}):Play()
@@ -885,7 +891,13 @@ function Speed_Library:CreateWindow(Config)
         end
   
         local _TabT = TweenService:Create(Tab, TweenInfo.new(0.6, Enum.EasingStyle.Back, Enum.EasingDirection.InOut), {BackgroundTransparency = 0.92})
-        local _FTween = TweenService:Create(FrameChoose, TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), { Position = UDim2.new(0, 2, 0, 9 + (33 * Tab.LayoutOrder)) })
+        local _OffsetY = 0
+        for _, OtherTab in pairs(ScrollTab:GetChildren()) do
+          if OtherTab.Name == "Tab" and OtherTab.LayoutOrder < Tab.LayoutOrder then
+            _OffsetY = _OffsetY + OtherTab.Size.Y.Offset
+          end
+        end
+        local _FTween = TweenService:Create(FrameChoose, TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), { Position = UDim2.new(0, 2, 0, 9 + _OffsetY) })
 
         _TabT:Play()
         _FTween:Play()
@@ -895,9 +907,11 @@ function Speed_Library:CreateWindow(Config)
         task.wait(0.05)
         NameTab.Text = _Name
   
+        if MyToken ~= TabClickToken then return end
         TweenService:Create(FrameChoose, TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), {Size = UDim2.new(0, 1, 0, 20)}):Play()
   
         task.wait(0.2)
+        if MyToken ~= TabClickToken then return end
         TweenService:Create(FrameChoose, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), {Size = UDim2.new(0, 1, 0, 12)}):Play()
       end
     end)
@@ -1294,19 +1308,18 @@ function Speed_Library:CreateWindow(Config)
 				}, Button)
 
         local function UpdateButtonSize()
-          local _Height = 12 + (12 * (ButtonContent.TextBounds.X // ButtonContent.AbsoluteSize.X))
-          ButtonContent.Size = UDim2.new(1, -100, 0, _Height)
-          
+          ButtonContent.TextWrapped = false
+          local Ratio = ButtonContent.TextBounds.X / ButtonContent.AbsoluteSize.X
+
+          ButtonContent.Size = UDim2.new(1, -100, 0, 12 + (12 * math.ceil(Ratio)))
           Button.Size = UDim2.new(1, 0, 0, ButtonContent.AbsoluteSize.Y + 33)
+          ButtonContent.TextWrapped = true
         end
       
-        ButtonContent.TextWrapped = true
         UpdateButtonSize()
       
         ButtonContent:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
-          ButtonContent.TextWrapped = false
           UpdateButtonSize()
-          ButtonContent.TextWrapped = true
           UpdateSizeSection()
         end)
 
